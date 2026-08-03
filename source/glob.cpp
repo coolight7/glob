@@ -3,6 +3,7 @@
 #include <cassert>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <regex>
 #include <string_view>
@@ -10,6 +11,14 @@
 namespace glob {
 
 namespace {
+
+/// 检查取消标记, 置位时抛出 cancelled_error (定义于 glob.h)。
+/// 空指针表示不检查, 保持原有行为。
+inline void check_cancel(const std::atomic<bool> *cancel_flag) {
+  if (cancel_flag != nullptr && cancel_flag->load(std::memory_order_relaxed)) {
+    throw cancelled_error("glob cancelled");
+  }
+}
 
 static constexpr auto SPECIAL_CHARACTERS = std::string_view{"()[]{}?*+-|^$\\.&~# \t\n\r\v\f"};
 static const auto ESCAPE_SET_OPER = std::regex(std::string{R"([&~|])"});
@@ -194,7 +203,8 @@ constexpr bool is_hidden(std::string_view pathname) noexcept { return pathname[0
 
 constexpr bool is_recursive(std::string_view pattern) noexcept { return pattern == std::string_view{"**"}; }
 
-std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly) {
+std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
+                                     const std::atomic<bool> *cancel_flag) {
   std::vector<fs::path> result;
 
   auto current_directory = dirname;
@@ -207,6 +217,8 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly) {
       for (auto &entry : fs::directory_iterator(
               current_directory, fs::directory_options::follow_directory_symlink |
                                       fs::directory_options::skip_permission_denied)) {
+        // 每个目录条目检查一次取消标记, 保证大目录遍历也能及时中断
+        check_cancel(cancel_flag);
         if (!dironly || entry.is_directory()) {
           if (dirname.is_absolute()) {
             result.push_back(entry.path());
@@ -215,6 +227,9 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly) {
           }
         }
       }
+    } catch (const cancelled_error &) {
+      // 取消必须向上传播, 不能当作 "not a directory" 吞掉
+      throw;
     } catch (std::exception&) {
       // not a directory
       // do nothing
@@ -225,13 +240,14 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly) {
 }
 
 // Recursively yields relative pathnames inside a literal directory.
-std::vector<fs::path> rlistdir(const fs::path &dirname, bool dironly) {
+std::vector<fs::path> rlistdir(const fs::path &dirname, bool dironly,
+                               const std::atomic<bool> *cancel_flag) {
   std::vector<fs::path> result;
-  auto names = iter_directory(dirname, dironly);
+  auto names = iter_directory(dirname, dironly, cancel_flag);
   for (auto &&name : names) {
     if (!is_hidden(name.string())) {
       result.push_back(name);
-      auto matched_dirs = rlistdir(name, dironly);
+      auto matched_dirs = rlistdir(name, dironly, cancel_flag);
       std::copy(std::make_move_iterator(matched_dirs.begin()), std::make_move_iterator(matched_dirs.end()), std::back_inserter(result));
     }
   }
@@ -241,7 +257,7 @@ std::vector<fs::path> rlistdir(const fs::path &dirname, bool dironly) {
 // This helper function recursively yields relative pathnames inside a literal
 // directory.
 std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::path &pattern,
-                            bool dironly) {
+                            bool dironly, const std::atomic<bool> *cancel_flag) {
   // std::cout << "In glob2\n";
   std::vector<fs::path> result;
   // look into the base directory as well, but only if it exists
@@ -249,7 +265,7 @@ std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::
     result.push_back(".");
   }
   assert(is_recursive(pattern.string()));
-  auto matched_dirs = rlistdir(dirname, dironly);
+  auto matched_dirs = rlistdir(dirname, dironly, cancel_flag);
   std::copy(std::make_move_iterator(matched_dirs.begin()), std::make_move_iterator(matched_dirs.end()), std::back_inserter(result));
   return result;
 }
@@ -259,10 +275,10 @@ std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::
 // takes a literal basename (so it only has to check for its existence).
 
 std::vector<fs::path> glob1(const fs::path &dirname, const fs::path &pattern,
-                            bool dironly) {
+                            bool dironly, const std::atomic<bool> *cancel_flag) {
   // std::cout << "In glob1\n";
   std::vector<fs::path> filtered_names;
-  auto names = iter_directory(dirname, dironly);
+  auto names = iter_directory(dirname, dironly, cancel_flag);
   for (auto &&name : names) {
     if (!is_hidden(name.string())) {
       filtered_names.push_back(name.filename());
@@ -279,10 +295,11 @@ std::vector<fs::path> glob1(const fs::path &dirname, const fs::path &pattern,
 }
 
 std::vector<fs::path> glob0(const fs::path &dirname, const fs::path &basename,
-                            bool /*dironly*/) {
+                            bool /*dironly*/, const std::atomic<bool> *cancel_flag) {
   // std::cout << "In glob0\n";
 
   // 'q*x/' should match only directories.
+  check_cancel(cancel_flag);
   if ((basename.empty() && fs::is_directory(dirname)) || (!basename.empty() && fs::exists(dirname / basename))) {
     return {basename};
   }
@@ -290,7 +307,8 @@ std::vector<fs::path> glob0(const fs::path &dirname, const fs::path &basename,
 }
 
 std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
-                           bool dironly = false) {
+                           bool dironly = false,
+                           const std::atomic<bool> *cancel_flag = nullptr) {
   std::vector<fs::path> result;
 
   const auto pathname = inpath.string();
@@ -316,14 +334,14 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
 
   if (dirname.empty()) {
     if (recursive && is_recursive(basename.string())) {
-      return glob2(dirname, basename, dironly);
+      return glob2(dirname, basename, dironly, cancel_flag);
     }
-    return glob1(dirname, basename, dironly);
+    return glob1(dirname, basename, dironly, cancel_flag);
   }
 
   std::vector<fs::path> dirs{dirname};
   if (dirname != fs::path(pathname) && has_magic(dirname.string())) {
-    dirs = glob(dirname, recursive, true);
+    dirs = glob(dirname, recursive, true, cancel_flag);
   }
 
   auto glob_in_dir = glob0;
@@ -336,7 +354,9 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
   }
 
   for (auto &d : dirs) {
-    for (auto &&name : glob_in_dir(d, basename, dironly)) {
+    // 每个目录层级检查一次取消标记
+    check_cancel(cancel_flag);
+    for (auto &&name : glob_in_dir(d, basename, dironly, cancel_flag)) {
       fs::path subresult = name;
       if (name.parent_path().empty()) {
         subresult = d / name;
@@ -351,17 +371,27 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
 } // namespace end
 
 std::vector<fs::path> glob(const std::string &pathname) {
-  return glob(pathname, false);
+  return glob(pathname, false, false, nullptr);
 }
 
 std::vector<fs::path> rglob(const std::string &pathname) {
-  return glob(pathname, true);
+  return glob(pathname, true, false, nullptr);
+}
+
+std::vector<fs::path> glob(const std::string &pathname,
+                           const std::atomic<bool> &cancel_flag) {
+  return glob(pathname, false, false, &cancel_flag);
+}
+
+std::vector<fs::path> rglob(const std::string &pathname,
+                            const std::atomic<bool> &cancel_flag) {
+  return glob(pathname, true, false, &cancel_flag);
 }
 
 std::vector<fs::path> glob(const std::vector<std::string> &pathnames) {
   std::vector<fs::path> result;
   for (const auto &pathname : pathnames) {
-    auto matched_res = glob(pathname, false);
+    auto matched_res = glob(pathname, false, false, nullptr);
     std::copy(std::make_move_iterator(matched_res.begin()), std::make_move_iterator(matched_res.end()), std::back_inserter(result));
   }
   return result;
@@ -370,7 +400,7 @@ std::vector<fs::path> glob(const std::vector<std::string> &pathnames) {
 std::vector<fs::path> rglob(const std::vector<std::string> &pathnames) {
   std::vector<fs::path> result;
   for (const auto &pathname : pathnames) {
-    auto matched_res = glob(pathname, true);
+    auto matched_res = glob(pathname, true, false, nullptr);
     std::copy(std::make_move_iterator(matched_res.begin()), std::make_move_iterator(matched_res.end()), std::back_inserter(result));
   }
   return result;
