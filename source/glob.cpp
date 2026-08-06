@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <map>
 #include <regex>
 #include <string_view>
@@ -308,10 +309,15 @@ std::vector<fs::path> glob0(const fs::path &dirname, const fs::path &basename,
 
 std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
                            bool dironly = false,
-                           const std::atomic<bool> *cancel_flag = nullptr) {
+                           const std::atomic<bool> *cancel_flag = nullptr,
+                           bool case_sensitive = true) {
   std::vector<fs::path> result;
 
-  const auto pathname = inpath.string();
+  auto pathname = inpath.string();
+  if (!case_sensitive) {
+    // 大小写不敏感: 将模式中的 ASCII 字母折叠为 [xX] 字符类后走统一流程
+    pathname = case_fold_pattern(pathname);
+  }
   auto path = fs::path(pathname);
 
   if (pathname[0] == '~') {
@@ -370,28 +376,164 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
 
 } // namespace end
 
+// ── 模式工具函数 (供上层 filesystem 工具使用) ────────────────────────────────
+
+bool has_recursive_segment(std::string_view pattern) noexcept {
+  return pattern.find("**") != std::string_view::npos;
+}
+
+fs::path static_prefix(std::string_view pattern) {
+  auto pos = pattern.find_first_of("*?[");
+  if (pos == std::string_view::npos) {
+    // 无通配符: 基准为其父目录
+    return fs::path{std::string{pattern}}.parent_path();
+  }
+  auto prefix = pattern.substr(0, pos);
+  auto slash  = prefix.find_last_of('/');
+  if (slash == std::string_view::npos) {
+    return fs::path{"."};
+  }
+  return fs::path{std::string{prefix.substr(0, slash + 1)}};
+}
+
+int path_depth(const fs::path &rel) noexcept {
+  int depth = 0;
+  for (auto seg = rel.begin(); seg != rel.end(); ++seg) {
+    if (*seg != "." && !seg->empty()) {
+      depth++;
+    }
+  }
+  return depth;
+}
+
+std::string to_regex(std::string_view pattern) {
+  std::string re;
+  re.reserve(pattern.size() * 2 + 4);
+  re            += '^';
+  const size_t n = pattern.size();
+  for (size_t i = 0; i < n; ++i) {
+    char c = pattern[i];
+    if (c == '*') {
+      re += ".*";
+      // 吞掉连续的 `*` (含 `**`)
+      while (i + 1 < n && pattern[i + 1] == '*') {
+        i++;
+      }
+    } else if (c == '?') {
+      re += '.';
+    } else if (c == '[') {
+      // 找到配对的 `]`, 字符类整体传递给正则
+      size_t j = i + 1;
+      if (j < n && (pattern[j] == '!' || pattern[j] == '^')) {
+        j++;
+      }
+      if (j < n && pattern[j] == ']') {
+        j++;
+      }
+      while (j < n && pattern[j] != ']') {
+        j++;
+      }
+      if (j >= n) {
+        // 无配对 `]`, 按字面量转义
+        re += "\\[";
+      } else {
+        std::string cls{pattern.substr(i, j - i + 1)};
+        // glob 的 `[!...]` 转正则的 `[^...]`
+        if (cls.size() > 1 && cls[1] == '!') {
+          cls[1] = '^';
+        }
+        re += cls;
+        i   = j;
+      }
+    } else {
+      // 转义正则特殊字符
+      static const std::string special = R"(\.^$+(){}|)";
+      if (special.find(c) != std::string::npos) {
+        re += '\\';
+      }
+      re += c;
+    }
+  }
+  re += '$';
+  return re;
+}
+
+std::string case_fold_pattern(std::string_view pattern) {
+  std::string out;
+  out.reserve(pattern.size() * 2);
+  bool inClass = false; // 是否处于字符类 [] 内
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    char c = pattern[i];
+    if (c == '\\' && i + 1 < pattern.size()) {
+      // 转义序列原样保留
+      out += c;
+      out += pattern[++i];
+      continue;
+    }
+    if (c == '[') {
+      inClass  = true;
+      out     += c;
+      continue;
+    }
+    if (c == ']' && inClass) {
+      inClass  = false;
+      out     += c;
+      continue;
+    }
+    if (!inClass && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+      auto lower  = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      auto upper  = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      out        += '[';
+      out        += lower;
+      out        += upper;
+      out        += ']';
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 std::vector<fs::path> glob(const std::string &pathname) {
-  return glob(pathname, false, false, nullptr);
+  return glob(pathname, false, false, nullptr, true);
 }
 
 std::vector<fs::path> rglob(const std::string &pathname) {
-  return glob(pathname, true, false, nullptr);
+  return glob(pathname, true, false, nullptr, true);
 }
 
 std::vector<fs::path> glob(const std::string &pathname,
                            const std::atomic<bool> &cancel_flag) {
-  return glob(pathname, false, false, &cancel_flag);
+  return glob(pathname, false, false, &cancel_flag, true);
 }
 
 std::vector<fs::path> rglob(const std::string &pathname,
                             const std::atomic<bool> &cancel_flag) {
-  return glob(pathname, true, false, &cancel_flag);
+  return glob(pathname, true, false, &cancel_flag, true);
+}
+
+std::vector<fs::path> glob(const std::string &pathname, bool case_sensitive) {
+  return glob(pathname, false, false, nullptr, case_sensitive);
+}
+
+std::vector<fs::path> rglob(const std::string &pathname, bool case_sensitive) {
+  return glob(pathname, true, false, nullptr, case_sensitive);
+}
+
+std::vector<fs::path> glob(const std::string &pathname, bool case_sensitive,
+                           const std::atomic<bool> &cancel_flag) {
+  return glob(pathname, false, false, &cancel_flag, case_sensitive);
+}
+
+std::vector<fs::path> rglob(const std::string &pathname, bool case_sensitive,
+                            const std::atomic<bool> &cancel_flag) {
+  return glob(pathname, true, false, &cancel_flag, case_sensitive);
 }
 
 std::vector<fs::path> glob(const std::vector<std::string> &pathnames) {
   std::vector<fs::path> result;
   for (const auto &pathname : pathnames) {
-    auto matched_res = glob(pathname, false, false, nullptr);
+    auto matched_res = glob(pathname, false, false, nullptr, true);
     std::copy(std::make_move_iterator(matched_res.begin()), std::make_move_iterator(matched_res.end()), std::back_inserter(result));
   }
   return result;
@@ -400,7 +542,7 @@ std::vector<fs::path> glob(const std::vector<std::string> &pathnames) {
 std::vector<fs::path> rglob(const std::vector<std::string> &pathnames) {
   std::vector<fs::path> result;
   for (const auto &pathname : pathnames) {
-    auto matched_res = glob(pathname, true, false, nullptr);
+    auto matched_res = glob(pathname, true, false, nullptr, true);
     std::copy(std::make_move_iterator(matched_res.begin()), std::make_move_iterator(matched_res.end()), std::back_inserter(result));
   }
   return result;
