@@ -9,6 +9,16 @@
 #include <regex>
 #include <string_view>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace glob {
 
 namespace {
@@ -23,12 +33,22 @@ namespace {
 //   "utf8-test-ßµ™∃", 曾导致 rglob 整体失败);
 // - 以窄字符串构造 path 会把 UTF-8 字节流误读为 GBK, 非 ASCII 模式永远
 //   匹配不上目录条目。
-// 因此 Windows 上经 char8_t 迭代器对 / u8string() 做 UTF-8 无损往返;
+// 此处 Windows 下使用 Win32 CP_UTF8 API 与 path.native() (wstring) 互转:
+// 1) 兼容 C++17 (glob 库 target 标准为 C++17, 无需 C++20 char8_t 关键字);
+// 2) 宽字符与 UTF-8 之间无损转换且永不抛异常;
 // POSIX 下 path::native() 本身就是 UTF-8 字节串, 直通零开销、行为不变。
 inline fs::path path_from_utf8(std::string_view utf8) {
 #ifdef _WIN32
-  return fs::path(reinterpret_cast<const char8_t *>(utf8.data()),
-                  reinterpret_cast<const char8_t *>(utf8.data() + utf8.size()));
+  if (utf8.empty()) {
+    return fs::path{};
+  }
+  int wlen = ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+  if (wlen <= 0) {
+    return fs::path{};
+  }
+  std::wstring wstr(static_cast<size_t>(wlen), L'\0');
+  ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wstr.data(), wlen);
+  return fs::path(std::move(wstr));
 #else
   return fs::path(std::string(utf8));
 #endif
@@ -36,8 +56,17 @@ inline fs::path path_from_utf8(std::string_view utf8) {
 
 inline std::string path_to_utf8(const fs::path &path) {
 #ifdef _WIN32
-  auto u8 = path.u8string(); // C++20 起返回 std::u8string, 宽->UTF-8 无损且不抛异常
-  return std::string(reinterpret_cast<const char *>(u8.data()), u8.size());
+  const std::wstring &wstr = path.native();
+  if (wstr.empty()) {
+    return std::string{};
+  }
+  int ulen = ::WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()), nullptr, 0, nullptr, nullptr);
+  if (ulen <= 0) {
+    return std::string{};
+  }
+  std::string u8(static_cast<size_t>(ulen), '\0');
+  ::WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()), u8.data(), ulen, nullptr, nullptr);
+  return u8;
 #else
   return path.string();
 #endif
