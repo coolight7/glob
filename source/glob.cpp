@@ -13,6 +13,36 @@ namespace glob {
 
 namespace {
 
+// ── UTF-8 <-> fs::path 无损转换 ─────────────────────────────────────────
+// 项目内部约定路径字符串为 UTF-8。Windows (MSVC) 下 fs::path 的窄字符串
+// 构造/导出按 ANSI 代码页 (如中文系统的 GBK/CP936) 解释和生成:
+// - path::string() 遇到代码页无法表示的字符时直接抛出
+//   std::system_error(ERROR_NO_UNICODE_TRANSLATION): "No mapping for the
+//   Unicode character exists in the target multi-byte codepage"
+//   (典型触发: 目录树中存在 GBK 外的文件名, 如 boost wave 测试数据
+//   "utf8-test-ßµ™∃", 曾导致 rglob 整体失败);
+// - 以窄字符串构造 path 会把 UTF-8 字节流误读为 GBK, 非 ASCII 模式永远
+//   匹配不上目录条目。
+// 因此 Windows 上经 char8_t 迭代器对 / u8string() 做 UTF-8 无损往返;
+// POSIX 下 path::native() 本身就是 UTF-8 字节串, 直通零开销、行为不变。
+inline fs::path path_from_utf8(std::string_view utf8) {
+#ifdef _WIN32
+  return fs::path(reinterpret_cast<const char8_t *>(utf8.data()),
+                  reinterpret_cast<const char8_t *>(utf8.data() + utf8.size()));
+#else
+  return fs::path(std::string(utf8));
+#endif
+}
+
+inline std::string path_to_utf8(const fs::path &path) {
+#ifdef _WIN32
+  auto u8 = path.u8string(); // C++20 起返回 std::u8string, 宽->UTF-8 无损且不抛异常
+  return std::string(reinterpret_cast<const char *>(u8.data()), u8.size());
+#else
+  return path.string();
+#endif
+}
+
 /// 检查取消标记, 置位时抛出 cancelled_error (定义于 glob.h)。
 /// 空指针表示不检查, 保持原有行为。
 inline void check_cancel(const std::atomic<bool> *cancel_flag) {
@@ -149,7 +179,7 @@ std::vector<fs::path> filter(const std::vector<fs::path> &names,
   std::vector<fs::path> result;
   std::copy_if(std::make_move_iterator(names.begin()), std::make_move_iterator(names.end()),
                std::back_inserter(result),
-               [&pattern_re](const fs::path& name) { return fnmatch(name.string(), pattern_re); });
+               [&pattern_re](const fs::path& name) { return fnmatch(path_to_utf8(name), pattern_re); });
   return result;
 }
 
@@ -187,10 +217,13 @@ fs::path expand_tilde(fs::path path) {
       throw std::invalid_argument("error: Unable to expand `~` - HOME environment variable not set.");
   }
 
-  std::string s = path.string();
-  if (s[0] == '~') {
-    s = std::string{home} + s.substr(1, s.size() - 1);
-    return fs::path(s);
+  std::string s = path_to_utf8(path);
+  if (!s.empty() && s[0] == '~') {
+    // home 取自环境变量 (Windows 上为 ANSI 窄编码): 先经普通窄构造得到正确的
+    // 原生 path, 再统一转回 UTF-8 与剩余部分 (内部 UTF-8) 拼接, 保证整串一致
+    std::string home_utf8 = path_to_utf8(fs::path(get_env(home_variable)));
+    s                     = home_utf8 + s.substr(1, s.size() - 1);
+    return path_from_utf8(s);
   }
   return path;
 }
@@ -246,7 +279,7 @@ std::vector<fs::path> rlistdir(const fs::path &dirname, bool dironly,
   std::vector<fs::path> result;
   auto names = iter_directory(dirname, dironly, cancel_flag);
   for (auto &&name : names) {
-    if (!is_hidden(name.string())) {
+    if (!is_hidden(path_to_utf8(name))) {
       result.push_back(name);
       auto matched_dirs = rlistdir(name, dironly, cancel_flag);
       std::copy(std::make_move_iterator(matched_dirs.begin()), std::make_move_iterator(matched_dirs.end()), std::back_inserter(result));
@@ -265,7 +298,7 @@ std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::
   if (fs::exists(dirname)) {
     result.push_back(".");
   }
-  assert(is_recursive(pattern.string()));
+  assert(is_recursive(path_to_utf8(pattern)));
   auto matched_dirs = rlistdir(dirname, dironly, cancel_flag);
   std::copy(std::make_move_iterator(matched_dirs.begin()), std::make_move_iterator(matched_dirs.end()), std::back_inserter(result));
   return result;
@@ -281,7 +314,7 @@ std::vector<fs::path> glob1(const fs::path &dirname, const fs::path &pattern,
   std::vector<fs::path> filtered_names;
   auto names = iter_directory(dirname, dironly, cancel_flag);
   for (auto &&name : names) {
-    if (!is_hidden(name.string())) {
+    if (!is_hidden(path_to_utf8(name))) {
       filtered_names.push_back(name.filename());
       // if (name.is_relative()) {
       //   // std::cout << "Filtered (Relative): " << name << "\n";
@@ -292,7 +325,7 @@ std::vector<fs::path> glob1(const fs::path &dirname, const fs::path &pattern,
       // }
     }
   }
-  return filter(filtered_names, pattern.string());
+  return filter(filtered_names, path_to_utf8(pattern));
 }
 
 std::vector<fs::path> glob0(const fs::path &dirname, const fs::path &basename,
@@ -313,12 +346,16 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
                            bool case_sensitive = true) {
   std::vector<fs::path> result;
 
-  auto pathname = inpath.string();
+  auto pathname = path_to_utf8(inpath);
   if (!case_sensitive) {
     // 大小写不敏感: 将模式中的 ASCII 字母折叠为 [xX] 字符类后走统一流程
     pathname = case_fold_pattern(pathname);
   }
-  auto path = fs::path(pathname);
+  auto path = path_from_utf8(pathname);
+
+  if (pathname.empty()) {
+    return result;
+  }
 
   if (pathname[0] == '~') {
     // expand tilde
@@ -339,20 +376,20 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
   }
 
   if (dirname.empty()) {
-    if (recursive && is_recursive(basename.string())) {
+    if (recursive && is_recursive(path_to_utf8(basename))) {
       return glob2(dirname, basename, dironly, cancel_flag);
     }
     return glob1(dirname, basename, dironly, cancel_flag);
   }
 
   std::vector<fs::path> dirs{dirname};
-  if (dirname != fs::path(pathname) && has_magic(dirname.string())) {
+  if (dirname != path_from_utf8(pathname) && has_magic(path_to_utf8(dirname))) {
     dirs = glob(dirname, recursive, true, cancel_flag);
   }
 
   auto glob_in_dir = glob0;
-  if (has_magic(basename.string())) {
-    if (recursive && is_recursive(basename.string())) {
+  if (has_magic(path_to_utf8(basename))) {
+    if (recursive && is_recursive(path_to_utf8(basename))) {
       glob_in_dir = glob2;
     } else {
       glob_in_dir = glob1;
@@ -386,14 +423,14 @@ fs::path static_prefix(std::string_view pattern) {
   auto pos = pattern.find_first_of("*?[");
   if (pos == std::string_view::npos) {
     // 无通配符: 基准为其父目录
-    return fs::path{std::string{pattern}}.parent_path();
+    return path_from_utf8(pattern).parent_path();
   }
   auto prefix = pattern.substr(0, pos);
   auto slash  = prefix.find_last_of('/');
   if (slash == std::string_view::npos) {
     return fs::path{"."};
   }
-  return fs::path{std::string{prefix.substr(0, slash + 1)}};
+  return path_from_utf8(prefix.substr(0, slash + 1));
 }
 
 int path_depth(const fs::path &rel) noexcept {
@@ -494,46 +531,48 @@ std::string case_fold_pattern(std::string_view pattern) {
   return out;
 }
 
+// 公有窄字符串入口: 调用方按项目约定传入 UTF-8, 显式经 path_from_utf8
+// 无损构造, 避免 Windows 下隐式窄构造按 ANSI 代码页误读
 std::vector<fs::path> glob(const std::string &pathname) {
-  return glob(pathname, false, false, nullptr, true);
+  return glob(path_from_utf8(pathname), false, false, nullptr, true);
 }
 
 std::vector<fs::path> rglob(const std::string &pathname) {
-  return glob(pathname, true, false, nullptr, true);
+  return glob(path_from_utf8(pathname), true, false, nullptr, true);
 }
 
 std::vector<fs::path> glob(const std::string &pathname,
                            const std::atomic<bool> &cancel_flag) {
-  return glob(pathname, false, false, &cancel_flag, true);
+  return glob(path_from_utf8(pathname), false, false, &cancel_flag, true);
 }
 
 std::vector<fs::path> rglob(const std::string &pathname,
                             const std::atomic<bool> &cancel_flag) {
-  return glob(pathname, true, false, &cancel_flag, true);
+  return glob(path_from_utf8(pathname), true, false, &cancel_flag, true);
 }
 
 std::vector<fs::path> glob(const std::string &pathname, bool case_sensitive) {
-  return glob(pathname, false, false, nullptr, case_sensitive);
+  return glob(path_from_utf8(pathname), false, false, nullptr, case_sensitive);
 }
 
 std::vector<fs::path> rglob(const std::string &pathname, bool case_sensitive) {
-  return glob(pathname, true, false, nullptr, case_sensitive);
+  return glob(path_from_utf8(pathname), true, false, nullptr, case_sensitive);
 }
 
 std::vector<fs::path> glob(const std::string &pathname, bool case_sensitive,
                            const std::atomic<bool> &cancel_flag) {
-  return glob(pathname, false, false, &cancel_flag, case_sensitive);
+  return glob(path_from_utf8(pathname), false, false, &cancel_flag, case_sensitive);
 }
 
 std::vector<fs::path> rglob(const std::string &pathname, bool case_sensitive,
                             const std::atomic<bool> &cancel_flag) {
-  return glob(pathname, true, false, &cancel_flag, case_sensitive);
+  return glob(path_from_utf8(pathname), true, false, &cancel_flag, case_sensitive);
 }
 
 std::vector<fs::path> glob(const std::vector<std::string> &pathnames) {
   std::vector<fs::path> result;
   for (const auto &pathname : pathnames) {
-    auto matched_res = glob(pathname, false, false, nullptr, true);
+    auto matched_res = glob(path_from_utf8(pathname), false, false, nullptr, true);
     std::copy(std::make_move_iterator(matched_res.begin()), std::make_move_iterator(matched_res.end()), std::back_inserter(result));
   }
   return result;
@@ -542,7 +581,7 @@ std::vector<fs::path> glob(const std::vector<std::string> &pathnames) {
 std::vector<fs::path> rglob(const std::vector<std::string> &pathnames) {
   std::vector<fs::path> result;
   for (const auto &pathname : pathnames) {
-    auto matched_res = glob(pathname, true, false, nullptr, true);
+    auto matched_res = glob(path_from_utf8(pathname), true, false, nullptr, true);
     std::copy(std::make_move_iterator(matched_res.begin()), std::make_move_iterator(matched_res.end()), std::back_inserter(result));
   }
   return result;
