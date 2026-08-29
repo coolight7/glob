@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cctype>
 #include <map>
+#include <optional>
 #include <regex>
 #include <string_view>
 
@@ -262,7 +263,25 @@ bool has_magic(const std::string &pathname) {
   return std::regex_search(pathname, magic_check);
 }
 
-constexpr bool is_hidden(std::string_view pathname) noexcept { return pathname[0] == '.'; }
+inline bool is_hidden(const fs::path &path) noexcept {
+#ifdef _WIN32
+  std::wstring_view s = path.native();
+  auto pos = s.find_last_of(L"/\\");
+  if (pos != std::wstring_view::npos) {
+    s = s.substr(pos + 1);
+  }
+  if (s.empty() || s == L"." || s == L"..") return false;
+  return s[0] == L'.';
+#else
+  std::string_view s = path.native();
+  auto pos = s.rfind('/');
+  if (pos != std::string_view::npos) {
+    s = s.substr(pos + 1);
+  }
+  if (s.empty() || s == "." || s == "..") return false;
+  return s[0] == '.';
+#endif
+}
 
 constexpr bool is_recursive(std::string_view pattern) noexcept { return pattern == std::string_view{"**"}; }
 
@@ -275,18 +294,20 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
     current_directory = fs::current_path();
   }
 
-  if (fs::exists(current_directory)) {
+  std::error_code ec;
+  if (fs::exists(current_directory, ec)) {
     try {
       for (auto &entry : fs::directory_iterator(
-              current_directory, fs::directory_options::follow_directory_symlink |
-                                      fs::directory_options::skip_permission_denied)) {
+              current_directory,
+              fs::directory_options::skip_permission_denied,
+              ec)) {
         // 每个目录条目检查一次取消标记, 保证大目录遍历也能及时中断
         check_cancel(cancel_flag);
-        if (!dironly || entry.is_directory()) {
-          if (dirname.is_absolute()) {
+        if (!dironly || entry.is_directory(ec)) {
+          if (dirname.is_absolute() || dirname.empty()) {
             result.push_back(entry.path());
           } else {
-            result.push_back(fs::relative(entry.path()));
+            result.push_back(dirname / entry.path().filename());
           }
         }
       }
@@ -303,17 +324,35 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
 }
 
 // Recursively yields relative pathnames inside a literal directory.
+void rlistdir_impl(const fs::path &dirname, bool dironly,
+                   const std::atomic<bool> *cancel_flag,
+                   std::vector<fs::path> &result) {
+  auto names = iter_directory(dirname, dironly, cancel_flag);
+  for (auto &&name : names) {
+    if (!is_hidden(name)) {
+      result.push_back(name);
+      // 仅对真实目录递归，避免符号链接目录导致的循环（“卡住”）以及对普通文件的无效递归
+      // - symlink 目录已 push 本身（上层可见），但不再展开其目标，避免 A->B->A 循环
+      // - 普通文件无需递归（iter_directory 对文件直接返回空）
+      std::error_code ec;
+      auto st = fs::symlink_status(name, ec);
+      if (ec) {
+        continue;
+      }
+      if (fs::is_symlink(st)) {
+        continue;
+      }
+      if (fs::is_directory(st)) {
+        rlistdir_impl(name, dironly, cancel_flag, result);
+      }
+    }
+  }
+}
+
 std::vector<fs::path> rlistdir(const fs::path &dirname, bool dironly,
                                const std::atomic<bool> *cancel_flag) {
   std::vector<fs::path> result;
-  auto names = iter_directory(dirname, dironly, cancel_flag);
-  for (auto &&name : names) {
-    if (!is_hidden(path_to_utf8(name))) {
-      result.push_back(name);
-      auto matched_dirs = rlistdir(name, dironly, cancel_flag);
-      std::copy(std::make_move_iterator(matched_dirs.begin()), std::make_move_iterator(matched_dirs.end()), std::back_inserter(result));
-    }
-  }
+  rlistdir_impl(dirname, dironly, cancel_flag, result);
   return result;
 }
 
@@ -337,24 +376,25 @@ std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::
 // They return a list of basenames.  _glob1 accepts a pattern while _glob0
 // takes a literal basename (so it only has to check for its existence).
 
-std::vector<fs::path> glob1(const fs::path &dirname, const fs::path &pattern,
-                            bool dironly, const std::atomic<bool> *cancel_flag) {
-  // std::cout << "In glob1\n";
+std::vector<fs::path> glob1_compiled(const fs::path &dirname, const std::regex &pattern_re,
+                                     bool dironly, const std::atomic<bool> *cancel_flag) {
   std::vector<fs::path> filtered_names;
   auto names = iter_directory(dirname, dironly, cancel_flag);
   for (auto &&name : names) {
-    if (!is_hidden(path_to_utf8(name))) {
-      filtered_names.push_back(name.filename());
-      // if (name.is_relative()) {
-      //   // std::cout << "Filtered (Relative): " << name << "\n";
-      //   filtered_names.push_back(fs::relative(name));
-      // } else {
-      //   // std::cout << "Filtered (Absolute): " << name << "\n";
-      //   filtered_names.push_back(name.filename());
-      // }
+    if (!is_hidden(name)) {
+      auto fn = name.filename();
+      if (fnmatch(path_to_utf8(fn), pattern_re)) {
+        filtered_names.push_back(std::move(fn));
+      }
     }
   }
-  return filter(filtered_names, path_to_utf8(pattern));
+  return filtered_names;
+}
+
+std::vector<fs::path> glob1(const fs::path &dirname, const fs::path &pattern,
+                            bool dironly, const std::atomic<bool> *cancel_flag) {
+  const auto pattern_re = compile_pattern(path_to_utf8(pattern));
+  return glob1_compiled(dirname, pattern_re, dironly, cancel_flag);
 }
 
 std::vector<fs::path> glob0(const fs::path &dirname, const fs::path &basename,
@@ -416,24 +456,41 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
     dirs = glob(dirname, recursive, true, cancel_flag);
   }
 
-  auto glob_in_dir = glob0;
-  if (has_magic(path_to_utf8(basename))) {
-    if (recursive && is_recursive(path_to_utf8(basename))) {
-      glob_in_dir = glob2;
-    } else {
-      glob_in_dir = glob1;
-    }
+  const auto basename_u8 = path_to_utf8(basename);
+  const bool basename_has_magic = has_magic(basename_u8);
+  const bool basename_is_rec = recursive && is_recursive(basename_u8);
+  std::optional<std::regex> compiled_basename_re;
+  if (basename_has_magic && !basename_is_rec) {
+    compiled_basename_re.emplace(compile_pattern(basename_u8));
   }
 
   for (auto &d : dirs) {
     // 每个目录层级检查一次取消标记
     check_cancel(cancel_flag);
-    for (auto &&name : glob_in_dir(d, basename, dironly, cancel_flag)) {
-      fs::path subresult = name;
-      if (name.parent_path().empty()) {
-        subresult = d / name;
+    if (!basename_has_magic) {
+      for (auto &&name : glob0(d, basename, dironly, cancel_flag)) {
+        fs::path subresult = name;
+        if (name.parent_path().empty()) {
+          subresult = d / name;
+        }
+        result.push_back(subresult.lexically_normal());
       }
-      result.push_back(subresult.lexically_normal());
+    } else if (basename_is_rec) {
+      for (auto &&name : glob2(d, basename, dironly, cancel_flag)) {
+        fs::path subresult = name;
+        if (name.parent_path().empty()) {
+          subresult = d / name;
+        }
+        result.push_back(subresult.lexically_normal());
+      }
+    } else {
+      for (auto &&name : glob1_compiled(d, *compiled_basename_re, dironly, cancel_flag)) {
+        fs::path subresult = name;
+        if (name.parent_path().empty()) {
+          subresult = d / name;
+        }
+        result.push_back(subresult.lexically_normal());
+      }
     }
   }
 
