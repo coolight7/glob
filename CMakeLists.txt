@@ -32,6 +32,9 @@ CPMAddPackage(
         VERSION 1.3
 )
 
+# Cross-compiling (e.g. MinGW from Linux) should not build googletest / glob_tests
+# which fail to link due to pthread/dupenv_s etc, but lib Glob itself builds fine
+if (NOT CMAKE_CROSSCOMPILING)
 CPMAddPackage(
         NAME googletest
         GITHUB_REPOSITORY google/googletest
@@ -41,6 +44,7 @@ CPMAddPackage(
 )
 # For Windows: Prevent overriding the parent project's compiler/linker settings
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+endif()
 
 # ---- Add source files ----
 
@@ -93,6 +97,9 @@ packageProject(
 )
 
 # --- setup tests ---
+if (CMAKE_CROSSCOMPILING)
+  return()
+endif()
 enable_testing()
 
 add_executable(glob_tests test/rglob_test.cpp)
