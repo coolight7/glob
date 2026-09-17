@@ -69,15 +69,26 @@ struct WalkPolicy {
     ///   该目录返回 true, 再由调用方自己过滤结果;
     /// - 为空表示不过滤。
     std::function<bool(const fs::path &entryPath, bool isDir)> keepPath{};
-    /// 匹配结果数量上限 (0 = 不限): 超过立即抛 [walk_limit_exceeded] 并停止遍历。
-    /// 空目录/不存在等中间层遍历不计入, 只统计最终匹配结果。
+    /// 匹配结果数量上限 (0 = 不限): 超过即停止遍历 (见 [stopOnLimit] 决定是抛异常
+    /// 还是返回已匹配结果)。空目录/不存在等中间层遍历不计入, 只统计最终匹配结果。
     size_t maxResults = 0;
     /// 累计已匹配结果数 (由遍历内部累加; 同一个 policy 可用于多次遍历, 从而对
     /// **多个 pattern 的总量**生效, 调用方也可在异常后读取它以报告实际数量)。
     size_t resultCount = 0;
+    /// 超过 [maxResults] 时的处理方式:
+    /// - false (默认): 抛 [walk_limit_exceeded], 本次遍历结果不返回, 由调用方报错;
+    /// - true: 不抛异常, 遍历立即停止并**返回已匹配到的结果** (调用方按
+    ///   [limitReached] 判断结果是否被截断)。适合"尽量给出一部分结果 + 提示"
+    ///   的调用方, 避免整个调用因规模过大而无任何返回值。
+    bool stopOnLimit = false;
+    /// 是否已因超过 [maxResults] 而停止 ([stopOnLimit] 模式下由遍历内部置位):
+    /// - 调用方据此判断"结果被截断, 还有更多匹配未收集";
+    /// - 同一 policy 再次遍历时立即返回空结果, 保证多 pattern 的总量不超上限。
+    bool limitReached = false;
 };
 
 /// 遍历匹配结果数超过 [WalkPolicy::maxResults] 时抛出
+/// ([WalkPolicy::stopOnLimit] 为 true 时不抛异常, 改为停止遍历并返回已匹配结果)
 class walk_limit_exceeded : public std::runtime_error {
 public:
     explicit walk_limit_exceeded(const std::string &what) : std::runtime_error(what) {}

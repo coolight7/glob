@@ -303,19 +303,40 @@ inline bool isExcludedByWalk(const WalkContext &walk, const fs::path &entryPath,
   return walk.keepPath != nullptr && false == (*walk.keepPath)(entryPath, isDir);
 }
 
-/// 计入一个匹配结果; 超过上限抛 [walk_limit_exceeded] (立即中断遍历)
-inline void countWalkResult(const WalkContext &walk) {
+/// 遍历是否已因超出数量上限而应停止 (仅 [WalkPolicy::stopOnLimit] 模式会置位)
+inline bool isLimitReached(const WalkContext &walk) {
+  return walk.countPolicy != nullptr && walk.countPolicy->limitReached;
+}
+
+/// 计入一个匹配结果。
+/// - 返回 true 表示**本次匹配不计入结果且遍历应立即停止**:
+///   - [WalkPolicy::stopOnLimit] = true: 已到上限, 置位 limitReached (停止遍历,
+///     已匹配结果由调用方退回);
+///   - 否则: 抛 [walk_limit_exceeded] 由调用方报错。
+/// - 调用方在"计数后立即 push"处判断返回值即可: 返回 true 时不 push,
+///   保证结果数不超过 maxResults。
+inline bool countWalkResult(const WalkContext &walk) {
   if (walk.countPolicy == nullptr) {
-    return;
+    return false;
+  }
+  // 已到上限 (前一 pattern / 前一目录层级触发): 不再收集, 直接要求停止
+  if (walk.countPolicy->limitReached) {
+    return true;
   }
   ++walk.countPolicy->resultCount;
   if (walk.countPolicy->maxResults > 0
       && walk.countPolicy->resultCount > walk.countPolicy->maxResults) {
+    if (walk.countPolicy->stopOnLimit) {
+      // 优雅停止: 第 maxResults+1 个匹配不收集, 遍历各层据 limitReached 退出
+      walk.countPolicy->limitReached = true;
+      return true;
+    }
     throw walk_limit_exceeded(
         "glob walk matched more than WalkPolicy::maxResults ("
         + std::to_string(walk.countPolicy->maxResults) + ")"
     );
   }
+  return false;
 }
 
 std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
@@ -337,6 +358,10 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
               ec)) {
         // 每个目录条目检查一次取消标记, 保证大目录遍历也能及时中断
         check_cancel(cancel_flag);
+        // 数量上限已到 (stopOnLimit): 立即停止, 不再继续读取目录条目
+        if (isLimitReached(walk)) {
+          break;
+        }
         // 条目路径与产出写法一致 (绝对 dirname → 绝对路径), 供排除过滤判定;
         // 被排除的条目直接跳过: 目录同时意味着整棵子树不再遍历 (剪枝)
         fs::path entry_path = (dirname.is_absolute() || dirname.empty())
@@ -374,8 +399,12 @@ void rlistdir_impl(const fs::path &dirname, bool dironly,
   auto names = iter_directory(dirname, dironly, cancel_flag, walk);
   for (auto &&name : names) {
     if (!is_hidden(name)) {
-      // 这里的产出即最终结果 (顶层 `**`), 因此在产生处即计入数量上限
-      countWalkResult(walk);
+      // 这里的产出即最终结果 (顶层 `**`), 因此在产生处即计入数量上限;
+      // 返回 true 表示已达上限 (stopOnLimit) 或已抛异常, 此时本层立即返回 ——
+      // 已收集的结果由调用方保留 (stopOnLimit 模式)
+      if (countWalkResult(walk)) {
+        return;
+      }
       result.push_back(name);
       // 仅对真实目录递归，避免符号链接目录导致的循环（“卡住”）以及对普通文件的无效递归
       // - symlink 目录已 push 本身（上层可见），但不再展开其目标，避免 A->B->A 循环
@@ -390,6 +419,10 @@ void rlistdir_impl(const fs::path &dirname, bool dironly,
       }
       if (fs::is_directory(st)) {
         rlistdir_impl(name, dironly, cancel_flag, result, walk);
+        // 递归层触发数量上限: 本层不再继续遍历兄弟目录
+        if (isLimitReached(walk)) {
+          return;
+        }
       }
     }
   }
@@ -412,8 +445,10 @@ std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::
   std::vector<fs::path> result;
   // look into the base directory as well, but only if it exists
   if (fs::exists(dirname)) {
-    countWalkResult(walk);
-    result.push_back(".");
+    // 数量上限已到 (stopOnLimit): 目录自身不再计入
+    if (false == countWalkResult(walk)) {
+      result.push_back(".");
+    }
   }
   assert(is_recursive(path_to_utf8(pattern)));
   auto matched_dirs = rlistdir(dirname, dironly, cancel_flag, walk);
@@ -431,6 +466,10 @@ std::vector<fs::path> glob1_compiled(const fs::path &dirname, const std::regex &
   std::vector<fs::path> filtered_names;
   auto names = iter_directory(dirname, dironly, cancel_flag, walk);
   for (auto &&name : names) {
+    // 数量上限已到: 不再匹配/收集本目录剩余条目 (由调用方在计数处判定并停止)
+    if (isLimitReached(walk)) {
+      break;
+    }
     if (!is_hidden(name)) {
       auto fn = name.filename();
       if (fnmatch(path_to_utf8(fn), pattern_re)) {
@@ -467,6 +506,12 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
                            const WalkContext &walk = WalkContext{}) {
   std::vector<fs::path> result;
 
+  // 数量上限已到 (同一 policy 用于多次遍历, 如上层多个 pattern): 不再遍历任何条目,
+  // 已匹配结果由调用方保留 (stopOnLimit 模式)
+  if (isLimitReached(walk)) {
+    return result;
+  }
+
   auto pathname = path_to_utf8(inpath);
   if (!case_sensitive) {
     // 大小写不敏感: 将模式中的 ASCII 字母折叠为 [xX] 字符类后走统一流程
@@ -493,8 +538,9 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
     if ((!basename.empty() && fs::exists(path)) || (basename.empty() && fs::is_directory(dirname))) {
       // 字面路径 (无通配符): 单个条目, 按真实类型判定排除
       if (false == isExcludedByWalk(walk, path, fs::is_directory(path))) {
-        countWalkResult(walk);
-        result.push_back(path);
+        if (false == countWalkResult(walk)) {
+          result.push_back(path);
+        }
       }
     }
     return result;
@@ -524,6 +570,10 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
   for (auto &d : dirs) {
     // 每个目录层级检查一次取消标记
     check_cancel(cancel_flag);
+    // 数量上限已到 (stopOnLimit): 不再展开剩余目录, 已匹配结果保留
+    if (isLimitReached(walk)) {
+      break;
+    }
     if (!basename_has_magic) {
       for (auto &&name : glob0(d, basename, dironly, cancel_flag)) {
         fs::path subresult = name;
@@ -533,7 +583,9 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
         // 条目级排除已在 iter_directory 完成 (那里能拿到类型, 目录命中即剪枝);
         // 此处只做计数与收集, 不再重复判定 —— 否则会以 isDir=false 误判目录
         auto normalized = subresult.lexically_normal();
-        countWalkResult(walk);
+        if (countWalkResult(walk)) {
+          break;
+        }
         result.push_back(std::move(normalized));
       }
     } else if (basename_is_rec) {
@@ -556,7 +608,9 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
         // 条目级排除已在 iter_directory 完成 (那里能拿到类型, 目录命中即剪枝);
         // 此处只做计数与收集, 不再重复判定 —— 否则会以 isDir=false 误判目录
         auto normalized = subresult.lexically_normal();
-        countWalkResult(walk);
+        if (countWalkResult(walk)) {
+          break;
+        }
         result.push_back(std::move(normalized));
       }
     }
@@ -724,7 +778,10 @@ std::vector<fs::path> rglob(const std::string &pathname, bool case_sensitive,
 }
 
 // 遍历策略版入口: 排除过滤 (命中目录整棵子树剪枝) 与匹配结果数量上限都在
-// 遍历过程中生效; 超限抛 walk_limit_exceeded (调用方据 policy.resultCount 报数)
+// 遍历过程中生效
+// - 超限处理见 [WalkPolicy::stopOnLimit]: false 抛 walk_limit_exceeded
+//   (调用方据 policy.resultCount 报数), true 停止遍历并返回已匹配结果
+//   (调用方据 policy.limitReached 判断是否被截断)
 
 std::vector<fs::path> glob(const std::string &pathname, bool case_sensitive,
                            const std::atomic<bool> &cancel_flag, WalkPolicy &policy) {
