@@ -285,8 +285,42 @@ inline bool is_hidden(const fs::path &path) noexcept {
 
 constexpr bool is_recursive(std::string_view pattern) noexcept { return pattern == std::string_view{"**"}; }
 
+/// 遍历过程上下文 (库内部传递)
+/// - [keepPath]: 条目排除过滤, 在**所有层级**生效 (命中目录即整棵子树剪枝)
+/// - [countPolicy]: 只有**顶层**调用传入 —— 中间层遍历的是中间结果 (如 `**` 的目录
+///   展开), 其数量不代表最终匹配结果, 不能计入上限
+struct WalkContext {
+  const std::function<bool(const fs::path &, bool)> *keepPath = nullptr;
+  WalkPolicy                                        *countPolicy = nullptr;
+
+  /// 中间层上下文: 保留排除过滤, 不计入最终结果数量
+  WalkContext excludeOnly() const { return WalkContext{keepPath, nullptr}; }
+};
+
+/// 条目是否被遍历策略排除 (无过滤时一律保留)
+inline bool isExcludedByWalk(const WalkContext &walk, const fs::path &entryPath,
+                             bool isDir) {
+  return walk.keepPath != nullptr && false == (*walk.keepPath)(entryPath, isDir);
+}
+
+/// 计入一个匹配结果; 超过上限抛 [walk_limit_exceeded] (立即中断遍历)
+inline void countWalkResult(const WalkContext &walk) {
+  if (walk.countPolicy == nullptr) {
+    return;
+  }
+  ++walk.countPolicy->resultCount;
+  if (walk.countPolicy->maxResults > 0
+      && walk.countPolicy->resultCount > walk.countPolicy->maxResults) {
+    throw walk_limit_exceeded(
+        "glob walk matched more than WalkPolicy::maxResults ("
+        + std::to_string(walk.countPolicy->maxResults) + ")"
+    );
+  }
+}
+
 std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
-                                     const std::atomic<bool> *cancel_flag) {
+                                     const std::atomic<bool> *cancel_flag,
+                                     const WalkContext &walk = WalkContext{}) {
   std::vector<fs::path> result;
 
   auto current_directory = dirname;
@@ -303,16 +337,25 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
               ec)) {
         // 每个目录条目检查一次取消标记, 保证大目录遍历也能及时中断
         check_cancel(cancel_flag);
+        // 条目路径与产出写法一致 (绝对 dirname → 绝对路径), 供排除过滤判定;
+        // 被排除的条目直接跳过: 目录同时意味着整棵子树不再遍历 (剪枝)
+        fs::path entry_path = (dirname.is_absolute() || dirname.empty())
+                                  ? entry.path()
+                                  : dirname / entry.path().filename();
+        // 有排除过滤时才需要区分目录 (目录被排除 = 剪枝, 见 WalkPolicy::keepPath)
+        const bool is_dir = walk.keepPath != nullptr ? entry.is_directory(ec) : false;
+        if (isExcludedByWalk(walk, entry_path, is_dir)) {
+          continue;
+        }
         if (!dironly || entry.is_directory(ec)) {
-          if (dirname.is_absolute() || dirname.empty()) {
-            result.push_back(entry.path());
-          } else {
-            result.push_back(dirname / entry.path().filename());
-          }
+          result.push_back(std::move(entry_path));
         }
       }
     } catch (const cancelled_error &) {
       // 取消必须向上传播, 不能当作 "not a directory" 吞掉
+      throw;
+    } catch (walk_limit_exceeded &) {
+      // 数量上限同样必须向上传播
       throw;
     } catch (std::exception&) {
       // not a directory
@@ -326,10 +369,13 @@ std::vector<fs::path> iter_directory(const fs::path &dirname, bool dironly,
 // Recursively yields relative pathnames inside a literal directory.
 void rlistdir_impl(const fs::path &dirname, bool dironly,
                    const std::atomic<bool> *cancel_flag,
-                   std::vector<fs::path> &result) {
-  auto names = iter_directory(dirname, dironly, cancel_flag);
+                   std::vector<fs::path> &result,
+                   const WalkContext &walk = WalkContext{}) {
+  auto names = iter_directory(dirname, dironly, cancel_flag, walk);
   for (auto &&name : names) {
     if (!is_hidden(name)) {
+      // 这里的产出即最终结果 (顶层 `**`), 因此在产生处即计入数量上限
+      countWalkResult(walk);
       result.push_back(name);
       // 仅对真实目录递归，避免符号链接目录导致的循环（“卡住”）以及对普通文件的无效递归
       // - symlink 目录已 push 本身（上层可见），但不再展开其目标，避免 A->B->A 循环
@@ -343,31 +389,34 @@ void rlistdir_impl(const fs::path &dirname, bool dironly,
         continue;
       }
       if (fs::is_directory(st)) {
-        rlistdir_impl(name, dironly, cancel_flag, result);
+        rlistdir_impl(name, dironly, cancel_flag, result, walk);
       }
     }
   }
 }
 
 std::vector<fs::path> rlistdir(const fs::path &dirname, bool dironly,
-                               const std::atomic<bool> *cancel_flag) {
+                               const std::atomic<bool> *cancel_flag,
+                               const WalkContext &walk = WalkContext{}) {
   std::vector<fs::path> result;
-  rlistdir_impl(dirname, dironly, cancel_flag, result);
+  rlistdir_impl(dirname, dironly, cancel_flag, result, walk);
   return result;
 }
 
 // This helper function recursively yields relative pathnames inside a literal
 // directory.
 std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::path &pattern,
-                            bool dironly, const std::atomic<bool> *cancel_flag) {
+                            bool dironly, const std::atomic<bool> *cancel_flag,
+                            const WalkContext &walk = WalkContext{}) {
   // std::cout << "In glob2\n";
   std::vector<fs::path> result;
   // look into the base directory as well, but only if it exists
   if (fs::exists(dirname)) {
+    countWalkResult(walk);
     result.push_back(".");
   }
   assert(is_recursive(path_to_utf8(pattern)));
-  auto matched_dirs = rlistdir(dirname, dironly, cancel_flag);
+  auto matched_dirs = rlistdir(dirname, dironly, cancel_flag, walk);
   std::copy(std::make_move_iterator(matched_dirs.begin()), std::make_move_iterator(matched_dirs.end()), std::back_inserter(result));
   return result;
 }
@@ -377,9 +426,10 @@ std::vector<fs::path> glob2(const fs::path &dirname, [[maybe_unused]] const fs::
 // takes a literal basename (so it only has to check for its existence).
 
 std::vector<fs::path> glob1_compiled(const fs::path &dirname, const std::regex &pattern_re,
-                                     bool dironly, const std::atomic<bool> *cancel_flag) {
+                                     bool dironly, const std::atomic<bool> *cancel_flag,
+                                     const WalkContext &walk = WalkContext{}) {
   std::vector<fs::path> filtered_names;
-  auto names = iter_directory(dirname, dironly, cancel_flag);
+  auto names = iter_directory(dirname, dironly, cancel_flag, walk);
   for (auto &&name : names) {
     if (!is_hidden(name)) {
       auto fn = name.filename();
@@ -392,9 +442,10 @@ std::vector<fs::path> glob1_compiled(const fs::path &dirname, const std::regex &
 }
 
 std::vector<fs::path> glob1(const fs::path &dirname, const fs::path &pattern,
-                            bool dironly, const std::atomic<bool> *cancel_flag) {
+                            bool dironly, const std::atomic<bool> *cancel_flag,
+                            const WalkContext &walk = WalkContext{}) {
   const auto pattern_re = compile_pattern(path_to_utf8(pattern));
-  return glob1_compiled(dirname, pattern_re, dironly, cancel_flag);
+  return glob1_compiled(dirname, pattern_re, dironly, cancel_flag, walk);
 }
 
 std::vector<fs::path> glob0(const fs::path &dirname, const fs::path &basename,
@@ -412,7 +463,8 @@ std::vector<fs::path> glob0(const fs::path &dirname, const fs::path &basename,
 std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
                            bool dironly = false,
                            const std::atomic<bool> *cancel_flag = nullptr,
-                           bool case_sensitive = true) {
+                           bool case_sensitive = true,
+                           const WalkContext &walk = WalkContext{}) {
   std::vector<fs::path> result;
 
   auto pathname = path_to_utf8(inpath);
@@ -439,21 +491,26 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
 
     // Patterns ending with a slash should match only directories
     if ((!basename.empty() && fs::exists(path)) || (basename.empty() && fs::is_directory(dirname))) {
-      result.push_back(path);
+      // 字面路径 (无通配符): 单个条目, 按真实类型判定排除
+      if (false == isExcludedByWalk(walk, path, fs::is_directory(path))) {
+        countWalkResult(walk);
+        result.push_back(path);
+      }
     }
     return result;
   }
 
   if (dirname.empty()) {
     if (recursive && is_recursive(path_to_utf8(basename))) {
-      return glob2(dirname, basename, dironly, cancel_flag);
+      return glob2(dirname, basename, dironly, cancel_flag, walk);
     }
-    return glob1(dirname, basename, dironly, cancel_flag);
+    return glob1(dirname, basename, dironly, cancel_flag, walk);
   }
 
   std::vector<fs::path> dirs{dirname};
   if (dirname != path_from_utf8(pathname) && has_magic(path_to_utf8(dirname))) {
-    dirs = glob(dirname, recursive, true, cancel_flag);
+    // 目录展开是中间层遍历: 保留排除过滤, 但不计入最终结果数量上限
+    dirs = glob(dirname, recursive, true, cancel_flag, case_sensitive, walk.excludeOnly());
   }
 
   const auto basename_u8 = path_to_utf8(basename);
@@ -473,23 +530,34 @@ std::vector<fs::path> glob(const fs::path &inpath, bool recursive = false,
         if (name.parent_path().empty()) {
           subresult = d / name;
         }
-        result.push_back(subresult.lexically_normal());
+        // 条目级排除已在 iter_directory 完成 (那里能拿到类型, 目录命中即剪枝);
+        // 此处只做计数与收集, 不再重复判定 —— 否则会以 isDir=false 误判目录
+        auto normalized = subresult.lexically_normal();
+        countWalkResult(walk);
+        result.push_back(std::move(normalized));
       }
     } else if (basename_is_rec) {
-      for (auto &&name : glob2(d, basename, dironly, cancel_flag)) {
+      // `**` 分支的匹配结果已在 glob2/rlistdir_impl 产生处计入数量上限
+      for (auto &&name : glob2(d, basename, dironly, cancel_flag, walk)) {
         fs::path subresult = name;
         if (name.parent_path().empty()) {
           subresult = d / name;
         }
-        result.push_back(subresult.lexically_normal());
+        // 同上: 排除判定已在 iter_directory 完成 (此分支的计数在 glob2/rlistdir_impl)
+        auto normalized = subresult.lexically_normal();
+        result.push_back(std::move(normalized));
       }
     } else {
-      for (auto &&name : glob1_compiled(d, *compiled_basename_re, dironly, cancel_flag)) {
+      for (auto &&name : glob1_compiled(d, *compiled_basename_re, dironly, cancel_flag, walk)) {
         fs::path subresult = name;
         if (name.parent_path().empty()) {
           subresult = d / name;
         }
-        result.push_back(subresult.lexically_normal());
+        // 条目级排除已在 iter_directory 完成 (那里能拿到类型, 目录命中即剪枝);
+        // 此处只做计数与收集, 不再重复判定 —— 否则会以 isDir=false 误判目录
+        auto normalized = subresult.lexically_normal();
+        countWalkResult(walk);
+        result.push_back(std::move(normalized));
       }
     }
   }
@@ -653,6 +721,47 @@ std::vector<fs::path> glob(const std::string &pathname, bool case_sensitive,
 std::vector<fs::path> rglob(const std::string &pathname, bool case_sensitive,
                             const std::atomic<bool> &cancel_flag) {
   return glob(path_from_utf8(pathname), true, false, &cancel_flag, case_sensitive);
+}
+
+// 遍历策略版入口: 排除过滤 (命中目录整棵子树剪枝) 与匹配结果数量上限都在
+// 遍历过程中生效; 超限抛 walk_limit_exceeded (调用方据 policy.resultCount 报数)
+
+std::vector<fs::path> glob(const std::string &pathname, bool case_sensitive,
+                           const std::atomic<bool> &cancel_flag, WalkPolicy &policy) {
+  WalkContext walk;
+  walk.keepPath    = policy.keepPath ? &policy.keepPath : nullptr;
+  walk.countPolicy = &policy;
+  return glob(path_from_utf8(pathname), false, false, &cancel_flag, case_sensitive, walk);
+}
+
+std::vector<fs::path> rglob(const std::string &pathname, bool case_sensitive,
+                            const std::atomic<bool> &cancel_flag, WalkPolicy &policy) {
+  WalkContext walk;
+  walk.keepPath    = policy.keepPath ? &policy.keepPath : nullptr;
+  walk.countPolicy = &policy;
+  return glob(path_from_utf8(pathname), true, false, &cancel_flag, case_sensitive, walk);
+}
+
+/// 模式是否为"覆盖整棵子树"的排除模式: 除首段外还出现 `**` 段
+/// (如 `**/build/**`、`a/**/*` 可剪枝; `**/build/*`、`build/*` 只匹配单层, 不剪枝)
+bool is_subtree_exclude_pattern(std::string_view pattern) noexcept {
+  size_t begin = 0;
+  size_t index = 0;
+  while (begin <= pattern.size()) {
+    auto end = pattern.find('/', begin);
+    if (end == std::string_view::npos) {
+      end = pattern.size();
+    }
+    if (index > 0 && pattern.substr(begin, end - begin) == std::string_view{"**"}) {
+      return true;
+    }
+    if (end == pattern.size()) {
+      break;
+    }
+    begin = end + 1;
+    ++index;
+  }
+  return false;
 }
 
 std::vector<fs::path> glob(const std::vector<std::string> &pathnames) {
